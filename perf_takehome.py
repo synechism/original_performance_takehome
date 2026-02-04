@@ -89,89 +89,191 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        SIMD Vectorized kernel with VLIW packing.
+
+        Process 8 elements at a time. Pack independent operations into same cycle.
+        Target: ~24 cycles per iteration = ~12,288 cycles total.
+
+        Resources per cycle:
+        - 6 VALU slots (vector ops on 8 elements)
+        - 12 ALU slots (scalar ops)
+        - 2 Load slots
+        - 2 Store slots
+        - 1 Flow slot (jumps, selects)
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        def emit(instr):
+            self.instrs.append(instr)
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # ============ SCRATCH ALLOCATION ============
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        # Vector registers (8 elements each)
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node = self.alloc_scratch("v_node", VLEN)
+        v_addr = self.alloc_scratch("v_addr", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
 
-        body = []  # array of slots
+        # Vector constants
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Hash constants (6 stages × 2 constants each)
+        v_hc1 = [self.alloc_scratch(f"v_hc1_{i}", VLEN) for i in range(6)]
+        v_hc3 = [self.alloc_scratch(f"v_hc3_{i}", VLEN) for i in range(6)]
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        # Scalar registers
+        s_tmp = self.alloc_scratch("s_tmp")
+        s_batch = self.alloc_scratch("s_batch")
+        s_idx_ptr = self.alloc_scratch("s_idx_ptr")
+        s_val_ptr = self.alloc_scratch("s_val_ptr")
+        s_save_idx = self.alloc_scratch("s_save_idx")  # saved ptr for store
+        s_save_val = self.alloc_scratch("s_save_val")
+        s_n_nodes = self.alloc_scratch("s_n_nodes")
+        s_forest_p = self.alloc_scratch("s_forest_p")
+        s_idx_base = self.alloc_scratch("s_idx_base")
+        s_val_base = self.alloc_scratch("s_val_base")
+        s_cond = self.alloc_scratch("s_cond")
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        # Scalar constants
+        s_zero = self.scratch_const(0)
+        s_one = self.scratch_const(1)
+        s_two = self.scratch_const(2)
+        s_vlen = self.scratch_const(VLEN)
+
+        num_batches = (batch_size // VLEN) * rounds  # 32 * 16 = 512
+        s_total = self.scratch_const(num_batches)
+        s_bpr = self.scratch_const(batch_size // VLEN)  # 32 batches per round
+
+        # ============ INITIALIZATION ============
+
+        # Load header values from memory (addresses 1, 4, 5, 6)
+        emit({"load": [("const", s_tmp, 1)]})
+        emit({"load": [("load", s_n_nodes, s_tmp)]})
+        emit({"load": [("const", s_tmp, 4)]})
+        emit({"load": [("load", s_forest_p, s_tmp)]})
+        emit({"load": [("const", s_tmp, 5)]})
+        emit({"load": [("load", s_idx_base, s_tmp)]})
+        emit({"load": [("const", s_tmp, 6)]})
+        emit({"load": [("load", s_val_base, s_tmp)]})
+
+        # Broadcast scalars to vectors (pack 2 per cycle)
+        emit({"valu": [("vbroadcast", v_forest_p, s_forest_p), ("vbroadcast", v_n_nodes, s_n_nodes)]})
+        emit({"valu": [("vbroadcast", v_zero, s_zero), ("vbroadcast", v_one, s_one)]})
+        emit({"valu": [("vbroadcast", v_two, s_two)]})
+
+        # Broadcast hash constants (2 per cycle)
+        for i in range(6):
+            c1 = self.scratch_const(HASH_STAGES[i][1])
+            c3 = self.scratch_const(HASH_STAGES[i][4])
+            emit({"valu": [("vbroadcast", v_hc1[i], c1), ("vbroadcast", v_hc3[i], c3)]})
+
+        emit({"flow": [("pause",)]})
+
+        # Initialize pointers and batch counter
+        emit({"alu": [
+            ("+", s_idx_ptr, s_idx_base, s_zero),
+            ("+", s_val_ptr, s_val_base, s_zero)
+        ]})
+        emit({"load": [("const", s_batch, 0)]})
+
+        # ============ MAIN LOOP ============
+        loop_start = len(self.instrs)
+
+        # --- Cycle 1: Load idx and val vectors ---
+        emit({"load": [("vload", v_idx, s_idx_ptr), ("vload", v_val, s_val_ptr)]})
+
+        # --- Cycle 2: Compute gather addresses + save pointers for later store ---
+        emit({
+            "valu": [("+", v_addr, v_forest_p, v_idx)],
+            "alu": [
+                ("+", s_save_idx, s_idx_ptr, s_zero),
+                ("+", s_save_val, s_val_ptr, s_zero)
+            ]
+        })
+
+        # --- Cycles 3-6: Gather node values + loop bookkeeping ---
+        # Cycle 3: gather[0:2] + batch++ + advance pointers
+        emit({
+            "load": [("load", v_node + 0, v_addr + 0), ("load", v_node + 1, v_addr + 1)],
+            "alu": [
+                ("+", s_batch, s_batch, s_one),
+                ("+", s_idx_ptr, s_idx_ptr, s_vlen),
+                ("+", s_val_ptr, s_val_ptr, s_vlen)
+            ]
+        })
+
+        # Cycle 4: gather[2:4] + compute wrap condition (batch % bpr)
+        emit({
+            "load": [("load", v_node + 2, v_addr + 2), ("load", v_node + 3, v_addr + 3)],
+            "alu": [("%", s_tmp, s_batch, s_bpr)]
+        })
+
+        # Cycle 5: gather[4:6] + check if wrap needed (tmp == 0)
+        emit({
+            "load": [("load", v_node + 4, v_addr + 4), ("load", v_node + 5, v_addr + 5)],
+            "alu": [("==", s_tmp, s_tmp, s_zero)]
+        })
+
+        # Cycle 6: gather[6:8] + apply wrap to idx_ptr
+        emit({
+            "load": [("load", v_node + 6, v_addr + 6), ("load", v_node + 7, v_addr + 7)],
+            "flow": [("select", s_idx_ptr, s_tmp, s_idx_base, s_idx_ptr)]
+        })
+
+        # --- Cycle 7: XOR + apply wrap to val_ptr ---
+        emit({
+            "valu": [("^", v_val, v_val, v_node)],
+            "flow": [("select", s_val_ptr, s_tmp, s_val_base, s_val_ptr)]
+        })
+
+        # --- Cycles 8-19: Hash computation (6 stages × 2 cycles) ---
+        for i in range(6):
+            op1, _, op2, op3, _ = HASH_STAGES[i]
+            # Parallel ops: tmp1 = op1(val, c1), tmp2 = op3(val, c3)
+            emit({"valu": [(op1, v_tmp1, v_val, v_hc1[i]), (op3, v_tmp2, v_val, v_hc3[i])]})
+            # Combine: val = op2(tmp1, tmp2)
+            emit({"valu": [(op2, v_val, v_tmp1, v_tmp2)]})
+
+        # --- Cycles 20-23: Index computation (optimized - no vselect!) ---
+        # Formula: new_idx = 2*idx + (1 if even else 2) = 2*idx + 2 - is_even
+        # where is_even = (val & 1) == 0
+
+        # Cycle 20: val & 1, idx << 1 (parallel)
+        emit({"valu": [
+            ("&", v_tmp1, v_val, v_one),   # tmp1 = val & 1 (0 if even, 1 if odd)
+            ("<<", v_idx, v_idx, v_one)    # idx = idx << 1
+        ]})
+
+        # Cycle 21: is_even test + idx += 2 (parallel - no dependency!)
+        emit({
+            "valu": [
+                ("==", v_tmp1, v_tmp1, v_zero),  # tmp1 = (val&1)==0 (1 if even, 0 if odd)
+                ("+", v_idx, v_idx, v_two)       # idx = 2*old_idx + 2
+            ],
+            "alu": [("<", s_cond, s_batch, s_total)]  # loop condition
+        })
+
+        # Cycle 22: idx -= is_even (gives 2*idx+1 if even, 2*idx+2 if odd)
+        emit({"valu": [("-", v_idx, v_idx, v_tmp1)]})
+
+        # Cycle 23: check bounds (idx < n_nodes) - tmp1 = 1 if valid, 0 if overflow
+        emit({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
+
+        # Cycle 24: Wrap index using multiply (no vselect needed!)
+        # idx * 1 = idx (valid), idx * 0 = 0 (overflow)
+        emit({"valu": [("*", v_idx, v_idx, v_tmp1)]})
+
+        # Cycle 25: Store both + jump
+        emit({
+            "store": [("vstore", s_save_idx, v_idx), ("vstore", s_save_val, v_val)],
+            "flow": [("cond_jump", s_cond, loop_start)]
+        })
+
+        emit({"flow": [("pause",)]})
 
 BASELINE = 147734
 
