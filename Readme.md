@@ -1,3 +1,6 @@
+Got down to 1354 cycles. Don't see an obvious way forward so I'll leave it here!
+
+
 # Anthropic's Original Performance Take-Home
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
