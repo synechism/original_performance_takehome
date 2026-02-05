@@ -89,191 +89,432 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        SIMD Vectorized kernel with VLIW packing.
+        Round-fused kernel with static list scheduling and shallow-tree preloading.
 
-        Process 8 elements at a time. Pack independent operations into same cycle.
-        Target: ~24 cycles per iteration = ~12,288 cycles total.
-
-        Resources per cycle:
-        - 6 VALU slots (vector ops on 8 elements)
-        - 12 ALU slots (scalar ops)
-        - 2 Load slots
-        - 2 Store slots
-        - 1 Flow slot (jumps, selects)
+        Strategy:
+        - Keep v_idx/v_val in scratch for all rounds (round fusion).
+        - Preload tree levels 0-3 (nodes 0-14) into vectors and use vselect for
+          rounds at shallow depths (including after wrap at depth 11).
+        - Use a dependency-aware list scheduler to pack ready ops into VLIW
+          bundles, saturating load/flow/valu slots.
         """
         def emit(instr):
             self.instrs.append(instr)
 
+        class Task:
+            def __init__(self, engine, slot, deps):
+                self.engine = engine
+                self.slot = slot
+                self.deps = deps
+                self.users = []
+                self.ready_cycle = 0
+
+        class ListScheduler:
+            def __init__(
+                self,
+                readonly_addrs: set[int],
+                serial_addrs: set[int],
+                nop_slot: tuple,
+            ):
+                self.tasks: list[Task] = []
+                self.last_write: dict[int, int] = {}
+                self.last_read: dict[int, int] = {}
+                self.last_access: dict[int, int] = {}
+                self.readonly = readonly_addrs
+                self.serial_addrs = serial_addrs
+                self.nop_slot = nop_slot
+
+            def add_task(self, engine, slot, reads, writes):
+                deps = {}
+                for addr in reads + writes:
+                    if addr in self.readonly:
+                        continue
+                    if addr in self.serial_addrs:
+                        if addr in self.last_access:
+                            deps[self.last_access[addr]] = max(deps.get(self.last_access[addr], 0), 1)
+
+                # RAW deps: read after last write (latency 1)
+                for addr in reads:
+                    if addr in self.readonly:
+                        continue
+                    if addr in self.serial_addrs:
+                        continue
+                    if addr in self.last_write:
+                        deps[self.last_write[addr]] = max(deps.get(self.last_write[addr], 0), 1)
+                # WAW deps: write after last write (latency 1)
+                for addr in writes:
+                    if addr in self.readonly:
+                        continue
+                    if addr in self.serial_addrs:
+                        continue
+                    if addr in self.last_write:
+                        deps[self.last_write[addr]] = max(deps.get(self.last_write[addr], 0), 1)
+                    # WAR deps: write after last read (latency 0, same-cycle ok)
+                    if addr in self.last_read:
+                        # WAR is safe in same cycle (reads observe old values)
+                        deps[self.last_read[addr]] = max(deps.get(self.last_read[addr], 0), 0)
+                tid = len(self.tasks)
+                task = Task(engine, slot, deps)
+                self.tasks.append(task)
+                for dep in deps:
+                    self.tasks[dep].users.append(tid)
+                for addr in reads:
+                    if addr in self.readonly:
+                        continue
+                    if addr in self.serial_addrs:
+                        self.last_access[addr] = tid
+                        continue
+                    self.last_read[addr] = tid
+                for addr in writes:
+                    if addr in self.readonly:
+                        continue
+                    if addr in self.serial_addrs:
+                        self.last_access[addr] = tid
+                        continue
+                    self.last_write[addr] = tid
+                return tid
+
+            def schedule(self):
+                n = len(self.tasks)
+                indeg = [len(t.deps) for t in self.tasks]
+                ready_by_engine = {k: [] for k in SLOT_LIMITS.keys()}
+                for tid in range(n):
+                    if indeg[tid] == 0:
+                        ready_by_engine[self.tasks[tid].engine].append(tid)
+
+                scheduled_cycle = [-1] * n
+                instrs = []
+                current_cycle = 0
+                remaining = n
+
+                engine_order = ["load", "valu", "alu", "flow", "store"]
+
+                while remaining > 0:
+                    bundle = {}
+                    scheduled_any = False
+                    for engine in engine_order:
+                        if engine not in SLOT_LIMITS:
+                            continue
+                        limit = SLOT_LIMITS[engine]
+                        if limit == 0:
+                            continue
+                        ready_list = ready_by_engine.get(engine, [])
+                        i = 0
+                        while limit > 0 and i < len(ready_list):
+                            tid = ready_list[i]
+                            task = self.tasks[tid]
+                            if task.ready_cycle <= current_cycle:
+                                bundle.setdefault(engine, []).append(task.slot)
+                                scheduled_cycle[tid] = current_cycle
+                                ready_list.pop(i)
+                                scheduled_any = True
+                                limit -= 1
+                                remaining -= 1
+                                for user in task.users:
+                                    indeg[user] -= 1
+                                    if indeg[user] == 0:
+                                        tuser = self.tasks[user]
+                                        if tuser.deps:
+                                            tuser.ready_cycle = max(
+                                                scheduled_cycle[d] + tuser.deps[d]
+                                                for d in tuser.deps
+                                            )
+                                        else:
+                                            tuser.ready_cycle = current_cycle
+                                        ready_by_engine[tuser.engine].append(user)
+                            else:
+                                i += 1
+                        ready_by_engine[engine] = ready_list
+
+                    if not scheduled_any:
+                        # Fallback to a harmless ALU op to advance the cycle.
+                        # This should be rare; indicates a scheduling gap.
+                        bundle = {"alu": [self.nop_slot]}
+
+                    instrs.append(bundle)
+                    current_cycle += 1
+
+                return instrs
+
+        def vec_addrs(base):
+            return list(range(base, base + VLEN))
+
         # ============ SCRATCH ALLOCATION ============
+        assert batch_size % VLEN == 0, "Batch size must be multiple of VLEN"
+        batches_total = batch_size // VLEN
+        tile_batches = 16
+        for cand in [32, 24, 16, 8, 4, 2, 1]:
+            if batches_total % cand == 0:
+                tile_batches = cand
+                break
+        num_tiles = batches_total // tile_batches
+        num_batches = tile_batches
+        preload_depth = 2
 
-        # Vector registers (8 elements each)
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node = self.alloc_scratch("v_node", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_idx = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(num_batches)]
+        v_val = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(num_batches)]
+        v_node = [self.alloc_scratch(f"v_node_{b}", VLEN) for b in range(num_batches)]
+        v_tmp = [self.alloc_scratch(f"v_tmp_{b}", VLEN) for b in range(num_batches)]
+        v_sel0 = [self.alloc_scratch(f"v_sel0_{b}", VLEN) for b in range(num_batches)]
 
-        # Vector constants
-        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
 
-        # Hash constants (6 stages × 2 constants each)
-        v_hc1 = [self.alloc_scratch(f"v_hc1_{i}", VLEN) for i in range(6)]
-        v_hc3 = [self.alloc_scratch(f"v_hc3_{i}", VLEN) for i in range(6)]
+        # multiply_add constants for stages 0, 2, 4
+        v_mul0 = self.alloc_scratch("v_mul0", VLEN)
+        v_mul2 = self.alloc_scratch("v_mul2", VLEN)
+        v_mul4 = self.alloc_scratch("v_mul4", VLEN)
+        v_hc0 = self.alloc_scratch("v_hc0", VLEN)
+        v_hc2 = self.alloc_scratch("v_hc2", VLEN)
+        v_hc4 = self.alloc_scratch("v_hc4", VLEN)
 
-        # Scalar registers
+        # XOR stage constants (1, 3, 5)
+        v_hc3 = self.alloc_scratch("v_hc3", VLEN)
+        v_hc5 = self.alloc_scratch("v_hc5", VLEN)
+        v_sh3 = self.alloc_scratch("v_sh3", VLEN)
+        v_sh5 = self.alloc_scratch("v_sh5", VLEN)
+
+        pre_nodes = 7
+        v_nodes = [self.alloc_scratch(f"v_node_pre_{i}", VLEN) for i in range(pre_nodes)]
+
         s_tmp = self.alloc_scratch("s_tmp")
-        s_batch = self.alloc_scratch("s_batch")
-        s_idx_ptr = self.alloc_scratch("s_idx_ptr")
-        s_val_ptr = self.alloc_scratch("s_val_ptr")
-        s_save_idx = self.alloc_scratch("s_save_idx")  # saved ptr for store
-        s_save_val = self.alloc_scratch("s_save_val")
-        s_n_nodes = self.alloc_scratch("s_n_nodes")
+        s_node = self.alloc_scratch("s_node")
         s_forest_p = self.alloc_scratch("s_forest_p")
-        s_idx_base = self.alloc_scratch("s_idx_base")
         s_val_base = self.alloc_scratch("s_val_base")
-        s_cond = self.alloc_scratch("s_cond")
+        s_val_ptr = self.alloc_scratch("s_val_ptr")
+        s_val_ptr2 = self.alloc_scratch("s_val_ptr2")
+        s_tile_off = self.alloc_scratch("s_tile_off")
+        s_nop = self.alloc_scratch("s_nop")
 
-        # Scalar constants
         s_zero = self.scratch_const(0)
         s_one = self.scratch_const(1)
         s_two = self.scratch_const(2)
         s_vlen = self.scratch_const(VLEN)
-
-        num_batches = (batch_size // VLEN) * rounds  # 32 * 16 = 512
-        s_total = self.scratch_const(num_batches)
-        s_bpr = self.scratch_const(batch_size // VLEN)  # 32 batches per round
+        s_2vlen = self.scratch_const(VLEN * 2)
 
         # ============ INITIALIZATION ============
-
-        # Load header values from memory (addresses 1, 4, 5, 6)
         emit({"load": [("const", s_tmp, 1)]})
-        emit({"load": [("load", s_n_nodes, s_tmp)]})
         emit({"load": [("const", s_tmp, 4)]})
         emit({"load": [("load", s_forest_p, s_tmp)]})
-        emit({"load": [("const", s_tmp, 5)]})
-        emit({"load": [("load", s_idx_base, s_tmp)]})
         emit({"load": [("const", s_tmp, 6)]})
         emit({"load": [("load", s_val_base, s_tmp)]})
 
-        # Broadcast scalars to vectors (pack 2 per cycle)
-        emit({"valu": [("vbroadcast", v_forest_p, s_forest_p), ("vbroadcast", v_n_nodes, s_n_nodes)]})
-        emit({"valu": [("vbroadcast", v_zero, s_zero), ("vbroadcast", v_one, s_one)]})
-        emit({"valu": [("vbroadcast", v_two, s_two)]})
+        emit({"alu": [("+", s_nop, s_zero, s_zero)]})
 
-        # Broadcast hash constants (2 per cycle)
-        for i in range(6):
-            c1 = self.scratch_const(HASH_STAGES[i][1])
-            c3 = self.scratch_const(HASH_STAGES[i][4])
-            emit({"valu": [("vbroadcast", v_hc1[i], c1), ("vbroadcast", v_hc3[i], c3)]})
+        emit({"valu": [("vbroadcast", v_zero, s_zero), ("vbroadcast", v_one, s_one), ("vbroadcast", v_two, s_two)]})
+
+        # multiply_add constants
+        s_4097 = self.scratch_const(4097)
+        s_33 = self.scratch_const(33)
+        s_9 = self.scratch_const(9)
+        emit({"valu": [("vbroadcast", v_mul0, s_4097), ("vbroadcast", v_mul2, s_33), ("vbroadcast", v_mul4, s_9)]})
+
+        s_c0 = self.scratch_const(HASH_STAGES[0][1])
+        s_c2 = self.scratch_const(HASH_STAGES[2][1])
+        s_c4 = self.scratch_const(HASH_STAGES[4][1])
+        emit({"valu": [("vbroadcast", v_hc0, s_c0), ("vbroadcast", v_hc2, s_c2), ("vbroadcast", v_hc4, s_c4)]})
+
+        s_c3 = self.scratch_const(HASH_STAGES[3][1])
+        s_c5 = self.scratch_const(HASH_STAGES[5][1])
+        s_c1 = self.scratch_const(HASH_STAGES[1][1])
+        emit({"valu": [("vbroadcast", v_hc3, s_c3), ("vbroadcast", v_hc5, s_c5)]})
+
+        s_19 = self.scratch_const(19)
+        s_9s = self.scratch_const(9)
+        s_16 = self.scratch_const(16)
+        emit({"valu": [("vbroadcast", v_sh3, s_9s), ("vbroadcast", v_sh5, s_16)]})
+
+        # Preload nodes (levels 0-2) into vectors
+        emit({"alu": [("+", s_tmp, s_forest_p, s_zero)]})
+        for i in range(pre_nodes):
+            emit({"load": [("load", s_node, s_tmp)]})
+            emit({"valu": [("vbroadcast", v_nodes[i], s_node)]})
+            if i + 1 < pre_nodes:
+                emit({"alu": [("+", s_tmp, s_tmp, s_one)]})
+
+        emit({"flow": [("pause",)]})
+
+        readonly_addrs = set()
+        for base in [
+            v_zero, v_one, v_two,
+            v_mul0, v_mul2, v_mul4, v_hc0, v_hc2, v_hc3, v_hc4, v_hc5,
+            v_sh3, v_sh5,
+        ]:
+            readonly_addrs.update(vec_addrs(base))
+        for vn in v_nodes:
+            readonly_addrs.update(vec_addrs(vn))
+
+        def add_valu(op, dest, a, b):
+            sched.add_task("valu", (op, dest, a, b), vec_addrs(a) + vec_addrs(b), vec_addrs(dest))
+
+        def add_madd(dest, a, b, c):
+            sched.add_task("valu", ("multiply_add", dest, a, b, c),
+                           vec_addrs(a) + vec_addrs(b) + vec_addrs(c), vec_addrs(dest))
+
+        def add_vselect(dest, cond, a, b):
+            sched.add_task("flow", ("vselect", dest, cond, a, b),
+                           vec_addrs(cond) + vec_addrs(a) + vec_addrs(b), vec_addrs(dest))
+
+        def add_load_lane(dest, addr):
+            sched.add_task("load", ("load", dest, addr), [addr], [dest])
+
+        def add_alu_vec(op, dest, a, b):
+            for lane in range(VLEN):
+                sched.add_task(
+                    "alu",
+                    (op, dest + lane, a + lane, b + lane),
+                    [a + lane, b + lane],
+                    [dest + lane],
+                )
+
+        def add_alu_vec_scalar(op, dest, a, b_scalar):
+            for lane in range(VLEN):
+                sched.add_task(
+                    "alu",
+                    (op, dest + lane, a + lane, b_scalar),
+                    [a + lane, b_scalar],
+                    [dest + lane],
+                )
+
+        def add_round(batch, depth):
+            vi = v_idx[batch]
+            vv = v_val[batch]
+            vn = v_node[batch]
+            vt = v_tmp[batch]
+            vs0 = v_sel0[batch]
+
+            # Node fetch: preloaded levels 0-2 at depths 0-2
+            if depth == 0:
+                add_valu("^", vv, vv, v_nodes[0])
+            elif depth == 1:
+                add_valu("&", vt, vi, v_one)
+                add_vselect(vn, vt, v_nodes[1], v_nodes[2])
+                add_valu("^", vv, vv, vn)
+            elif depth == 2:
+                add_valu("&", vt, vi, v_one)  # mask0
+                add_vselect(vn, vt, v_nodes[5], v_nodes[4])   # t0
+                add_vselect(vs0, vt, v_nodes[3], v_nodes[6])  # t1
+                add_valu("&", vt, vi, v_two)  # mask1
+                add_vselect(vn, vt, vs0, vn)
+                add_valu("^", vv, vv, vn)
+            else:
+                add_alu_vec_scalar("+", vn, vi, s_forest_p)
+                for lane in range(VLEN):
+                    add_load_lane(vt + lane, vn + lane)
+                add_valu("^", vv, vv, vt)
+
+            # Hash stages
+            add_madd(vv, vv, v_mul0, v_hc0)
+
+            # Stage 1 (xor / shift) using ALU lanes with scalar constants
+            add_alu_vec_scalar(">>", vt, vv, s_19)
+            add_alu_vec_scalar("^", vv, vv, s_c1)
+            add_alu_vec("^", vv, vv, vt)
+
+            add_madd(vv, vv, v_mul2, v_hc2)
+
+            add_valu("<<", vt, vv, v_sh3)
+            add_valu("+", vv, vv, v_hc3)
+            add_valu("^", vv, vv, vt)
+
+            add_madd(vv, vv, v_mul4, v_hc4)
+
+            add_valu(">>", vt, vv, v_sh5)
+            add_valu("^", vv, vv, v_hc5)
+            add_valu("^", vv, vv, vt)
+
+            # Index update: for max depth, always wraps to 0
+            if depth == forest_height:
+                add_valu("+", vi, v_zero, v_zero)
+            elif depth == 0:
+                # idx starts at 0 for depth 0, so idx = 1 + (val & 1)
+                add_valu("&", vt, vv, v_one)
+                add_valu("+", vt, vt, v_one)
+                add_valu("+", vi, vt, v_zero)
+            else:
+                # idx = (idx << 1) + 1 + (val & 1)
+                add_valu("&", vt, vv, v_one)
+                add_valu("+", vt, vt, v_one)
+                add_madd(vi, vi, v_two, vt)
+
+        for tile in range(num_tiles):
+            if num_tiles == 1:
+                emit({
+                    "alu": [
+                        ("+", s_val_ptr, s_val_base, s_zero),
+                        ("+", s_val_ptr2, s_val_base, s_vlen),
+                    ]
+                })
+            else:
+                s_off = self.scratch_const(tile * tile_batches * VLEN)
+                emit({"alu": [("+", s_tile_off, s_off, s_zero)]})
+                emit({
+                    "alu": [
+                        ("+", s_val_ptr, s_val_base, s_tile_off),
+                    ]
+                })
+                emit({
+                    "alu": [
+                        ("+", s_val_ptr2, s_val_ptr, s_vlen),
+                    ]
+                })
+            for b in range(0, num_batches, 2):
+                if b + 1 < num_batches:
+                    emit({
+                        "load": [
+                            ("vload", v_val[b], s_val_ptr),
+                            ("vload", v_val[b + 1], s_val_ptr2),
+                        ],
+                        "valu": [
+                            ("vbroadcast", v_idx[b], s_zero),
+                            ("vbroadcast", v_idx[b + 1], s_zero),
+                        ],
+                        "alu": [
+                            ("+", s_val_ptr, s_val_ptr, s_2vlen),
+                            ("+", s_val_ptr2, s_val_ptr2, s_2vlen),
+                        ],
+                    })
+                else:
+                    emit({
+                        "load": [("vload", v_val[b], s_val_ptr)],
+                        "valu": [("vbroadcast", v_idx[b], s_zero)],
+                        "alu": [("+", s_val_ptr, s_val_ptr, s_vlen)],
+                    })
+
+            sched = ListScheduler(
+                readonly_addrs,
+                set(),
+                ("+", s_nop, s_nop, s_zero),
+            )
+
+            for r in range(rounds):
+                depth = r % (forest_height + 1)
+                for b in range(num_batches):
+                    add_round(b, depth)
+
+            self.instrs.extend(sched.schedule())
+
+            if num_tiles == 1:
+                emit({
+                    "alu": [
+                        ("+", s_val_ptr, s_val_base, s_zero),
+                    ]
+                })
+            else:
+                emit({
+                    "alu": [
+                        ("+", s_val_ptr, s_val_base, s_tile_off),
+                    ]
+                })
+            for b in range(num_batches):
+                emit({
+                    "store": [("vstore", s_val_ptr, v_val[b])],
+                    "alu": [("+", s_val_ptr, s_val_ptr, s_vlen)]
+                })
 
         emit({"flow": [("pause",)]})
 
-        # Initialize pointers and batch counter
-        emit({"alu": [
-            ("+", s_idx_ptr, s_idx_base, s_zero),
-            ("+", s_val_ptr, s_val_base, s_zero)
-        ]})
-        emit({"load": [("const", s_batch, 0)]})
-
-        # ============ MAIN LOOP ============
-        loop_start = len(self.instrs)
-
-        # --- Cycle 1: Load idx and val vectors ---
-        emit({"load": [("vload", v_idx, s_idx_ptr), ("vload", v_val, s_val_ptr)]})
-
-        # --- Cycle 2: Compute gather addresses + save pointers for later store ---
-        emit({
-            "valu": [("+", v_addr, v_forest_p, v_idx)],
-            "alu": [
-                ("+", s_save_idx, s_idx_ptr, s_zero),
-                ("+", s_save_val, s_val_ptr, s_zero)
-            ]
-        })
-
-        # --- Cycles 3-6: Gather node values + loop bookkeeping ---
-        # Cycle 3: gather[0:2] + batch++ + advance pointers
-        emit({
-            "load": [("load", v_node + 0, v_addr + 0), ("load", v_node + 1, v_addr + 1)],
-            "alu": [
-                ("+", s_batch, s_batch, s_one),
-                ("+", s_idx_ptr, s_idx_ptr, s_vlen),
-                ("+", s_val_ptr, s_val_ptr, s_vlen)
-            ]
-        })
-
-        # Cycle 4: gather[2:4] + compute wrap condition (batch % bpr)
-        emit({
-            "load": [("load", v_node + 2, v_addr + 2), ("load", v_node + 3, v_addr + 3)],
-            "alu": [("%", s_tmp, s_batch, s_bpr)]
-        })
-
-        # Cycle 5: gather[4:6] + check if wrap needed (tmp == 0)
-        emit({
-            "load": [("load", v_node + 4, v_addr + 4), ("load", v_node + 5, v_addr + 5)],
-            "alu": [("==", s_tmp, s_tmp, s_zero)]
-        })
-
-        # Cycle 6: gather[6:8] + apply wrap to idx_ptr
-        emit({
-            "load": [("load", v_node + 6, v_addr + 6), ("load", v_node + 7, v_addr + 7)],
-            "flow": [("select", s_idx_ptr, s_tmp, s_idx_base, s_idx_ptr)]
-        })
-
-        # --- Cycle 7: XOR + apply wrap to val_ptr ---
-        emit({
-            "valu": [("^", v_val, v_val, v_node)],
-            "flow": [("select", s_val_ptr, s_tmp, s_val_base, s_val_ptr)]
-        })
-
-        # --- Cycles 8-19: Hash computation (6 stages × 2 cycles) ---
-        for i in range(6):
-            op1, _, op2, op3, _ = HASH_STAGES[i]
-            # Parallel ops: tmp1 = op1(val, c1), tmp2 = op3(val, c3)
-            emit({"valu": [(op1, v_tmp1, v_val, v_hc1[i]), (op3, v_tmp2, v_val, v_hc3[i])]})
-            # Combine: val = op2(tmp1, tmp2)
-            emit({"valu": [(op2, v_val, v_tmp1, v_tmp2)]})
-
-        # --- Cycles 20-23: Index computation (optimized - no vselect!) ---
-        # Formula: new_idx = 2*idx + (1 if even else 2) = 2*idx + 2 - is_even
-        # where is_even = (val & 1) == 0
-
-        # Cycle 20: val & 1, idx << 1 (parallel)
-        emit({"valu": [
-            ("&", v_tmp1, v_val, v_one),   # tmp1 = val & 1 (0 if even, 1 if odd)
-            ("<<", v_idx, v_idx, v_one)    # idx = idx << 1
-        ]})
-
-        # Cycle 21: is_even test + idx += 2 (parallel - no dependency!)
-        emit({
-            "valu": [
-                ("==", v_tmp1, v_tmp1, v_zero),  # tmp1 = (val&1)==0 (1 if even, 0 if odd)
-                ("+", v_idx, v_idx, v_two)       # idx = 2*old_idx + 2
-            ],
-            "alu": [("<", s_cond, s_batch, s_total)]  # loop condition
-        })
-
-        # Cycle 22: idx -= is_even (gives 2*idx+1 if even, 2*idx+2 if odd)
-        emit({"valu": [("-", v_idx, v_idx, v_tmp1)]})
-
-        # Cycle 23: check bounds (idx < n_nodes) - tmp1 = 1 if valid, 0 if overflow
-        emit({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-
-        # Cycle 24: Wrap index using multiply (no vselect needed!)
-        # idx * 1 = idx (valid), idx * 0 = 0 (overflow)
-        emit({"valu": [("*", v_idx, v_idx, v_tmp1)]})
-
-        # Cycle 25: Store both + jump
-        emit({
-            "store": [("vstore", s_save_idx, v_idx), ("vstore", s_save_val, v_val)],
-            "flow": [("cond_jump", s_cond, loop_start)]
-        })
-
-        emit({"flow": [("pause",)]})
 
 BASELINE = 147734
 
