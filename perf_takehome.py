@@ -107,7 +107,8 @@ class KernelBuilder:
         use_state_machine = use_state_machine or os.getenv("STATE_MACHINE") == "1"
         use_aggressive = os.getenv("AGGRESSIVE") == "1"
         use_pipeline = os.getenv("PIPELINE") == "1"
-        use_static = os.getenv("STATIC", "1") == "1"
+        use_cycle = os.getenv("CYCLE", "1") == "1"
+        use_static = os.getenv("STATIC", "1") == "1" and not use_cycle
 
         def emit(instr):
             self.instrs.append(instr)
@@ -342,6 +343,107 @@ class KernelBuilder:
                 for i, bundle in enumerate(instrs):
                     if not bundle:
                         instrs[i] = {"alu": [self.nop_slot]}
+
+                return instrs
+
+        class CycleScheduler(ListScheduler):
+            """
+            Cycle-based list scheduler with per-engine priority queues.
+            Picks ready tasks each cycle to maximize bundle fullness.
+            """
+            def schedule(self):
+                import heapq
+
+                n = len(self.tasks)
+                indeg = [len(t.deps) for t in self.tasks]
+                scheduled_cycle = [-1] * n
+
+                # Compute critical-path height for priority
+                indeg2 = indeg[:]
+                topo = []
+                queue = [tid for tid in range(n) if indeg2[tid] == 0]
+                while queue:
+                    tid = queue.pop()
+                    topo.append(tid)
+                    for user in self.tasks[tid].users:
+                        indeg2[user] -= 1
+                        if indeg2[user] == 0:
+                            queue.append(user)
+                height = [1] * n
+                for tid in reversed(topo):
+                    if self.tasks[tid].users:
+                        height[tid] = 1 + max(height[u] for u in self.tasks[tid].users)
+
+                future = []
+                for tid in range(n):
+                    if indeg[tid] == 0:
+                        heapq.heappush(future, (0, tid))
+
+                engine_heaps = {engine: [] for engine in SLOT_LIMITS.keys()}
+                engine_prio = {
+                    "flow": 0,
+                    "load": 1,
+                    "valu": 2,
+                    "alu": 3,
+                    "store": 4,
+                    "debug": 5,
+                }
+
+                instrs = []
+                current_cycle = 0
+                remaining = n
+
+                engine_order = ["flow", "load", "valu", "alu", "store", "debug"]
+
+                while remaining > 0:
+                    while future and future[0][0] <= current_cycle:
+                        ready_cycle, tid = heapq.heappop(future)
+                        task = self.tasks[tid]
+                        prio = engine_prio.get(task.engine, 9)
+                        heapq.heappush(engine_heaps[task.engine], (-height[tid], prio, tid))
+
+                    bundle = {}
+                    scheduled_any = False
+                    for engine in engine_order:
+                        if engine not in SLOT_LIMITS:
+                            continue
+                        limit = SLOT_LIMITS[engine]
+                        if limit == 0:
+                            continue
+                        heap = engine_heaps.get(engine, [])
+                        while limit > 0 and heap:
+                            _neg_h, _prio, tid = heapq.heappop(heap)
+                            if scheduled_cycle[tid] != -1:
+                                continue
+                            task = self.tasks[tid]
+                            if task.ready_cycle > current_cycle:
+                                # Not ready yet, push back
+                                heapq.heappush(heap, (_neg_h, _prio, tid))
+                                break
+                            bundle.setdefault(engine, []).append(task.slot)
+                            scheduled_cycle[tid] = current_cycle
+                            scheduled_any = True
+                            limit -= 1
+                            remaining -= 1
+                            for user in task.users:
+                                indeg[user] -= 1
+                                if indeg[user] == 0:
+                                    tuser = self.tasks[user]
+                                    if tuser.deps:
+                                        tuser.ready_cycle = max(
+                                            scheduled_cycle[d] + tuser.deps[d]
+                                            for d in tuser.deps
+                                        )
+                                    else:
+                                        tuser.ready_cycle = 0
+                                    heapq.heappush(future, (tuser.ready_cycle, user))
+                        engine_heaps[engine] = heap
+
+                    if not scheduled_any:
+                        bundle = {"alu": [self.nop_slot]}
+
+                    instrs.append(bundle)
+                    current_cycle += 1
 
                 return instrs
 
@@ -931,7 +1033,9 @@ class KernelBuilder:
                 serial_addrs.update(vec_addrs(v_sel1_shared))
             if v_sel2_shared is not None:
                 serial_addrs.update(vec_addrs(v_sel2_shared))
-            if use_static:
+            if use_cycle:
+                Scheduler = CycleScheduler
+            elif use_static:
                 Scheduler = StaticScheduler
             elif use_state_machine:
                 Scheduler = StateMachineScheduler
